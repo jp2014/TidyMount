@@ -1,4 +1,5 @@
 import SwiftUI
+import ServiceManagement
 
 struct MainMenuView: View {
     @ObservedObject var manager: MountManager
@@ -131,10 +132,20 @@ struct SettingsView: View {
                 }
                 
                 Section(header: Text("General Settings")) {
-                    Toggle("Launch at Login", isOn: Binding(
-                        get: { manager.isLaunchingAtLogin },
-                        set: { _ in manager.toggleLaunchAtLogin() }
-                    ))
+                    VStack(alignment: .leading) {
+                        Toggle("Launch at Login", isOn: Binding(
+                            get: { manager.isLaunchingAtLogin },
+                            set: { newValue in manager.setLaunchAtLogin(enabled: newValue) }
+                        ))
+                        
+                        if #available(macOS 13.0, *) {
+                            if SMAppService.mainApp.status == .requiresApproval {
+                                Text("⚠️ Approval required in System Settings")
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                        }
+                    }
                 }
             }
             

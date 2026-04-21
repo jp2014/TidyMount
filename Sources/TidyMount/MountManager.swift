@@ -194,24 +194,46 @@ class MountManager: ObservableObject {
         saveShares()
     }
     
-    func toggleLaunchAtLogin() {
+    func setLaunchAtLogin(enabled: Bool) {
         if #available(macOS 13.0, *) {
+            let service = SMAppService.mainApp
+            logger.info("Setting launch at login to: \(enabled). Current status: \(String(describing: service.status))")
+            
+            // If the requested state matches current status, do nothing
+            let isCurrentlyEnabled = (service.status == .enabled || service.status == .requiresApproval)
+            if isCurrentlyEnabled == enabled {
+                logger.info("Current status already matches requested state.")
+                return
+            }
+            
             do {
-                if SMAppService.mainApp.status == .enabled {
-                    try SMAppService.mainApp.unregister()
+                if enabled {
+                    try service.register()
+                    logger.info("Successfully registered launch at login")
                 } else {
-                    try SMAppService.mainApp.register()
+                    try service.unregister()
+                    logger.info("Successfully unregistered launch at login")
                 }
-                updateLaunchAtLoginStatus()
             } catch {
-                logger.error("Failed to toggle launch at login: \(error.localizedDescription)")
+                logger.error("Failed to set launch at login: \(error.localizedDescription)")
+            }
+            
+            // Re-fetch status immediately
+            updateLaunchAtLoginStatus()
+            
+            // Sometimes it takes a moment for the system to update the status,
+            // so we'll check again in a second.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.updateLaunchAtLoginStatus()
             }
         }
     }
     
     func updateLaunchAtLoginStatus() {
         if #available(macOS 13.0, *) {
-            isLaunchingAtLogin = SMAppService.mainApp.status == .enabled
+            let status = SMAppService.mainApp.status
+            logger.info("Current launch at login status: \(String(describing: status))")
+            isLaunchingAtLogin = (status == .enabled || status == .requiresApproval)
         }
     }
 }

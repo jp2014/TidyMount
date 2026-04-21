@@ -9,8 +9,8 @@ MACOS_DIR="${CONTENTS_DIR}/MacOS"
 echo "Creating bundle structure..."
 mkdir -p "${MACOS_DIR}"
 
-# Compile Universal Binary
-echo "Compiling Universal Binary (arm64 + x86_64)..."
+# Compile Binary
+echo "Compiling Binary for $(uname -m)..."
 swiftc -o "${MACOS_DIR}/${APP_NAME}" \
     -sdk $(xcrun --show-sdk-path) \
     -framework NetFS \
@@ -19,8 +19,7 @@ swiftc -o "${MACOS_DIR}/${APP_NAME}" \
     -framework ServiceManagement \
     -framework Network \
     -framework Combine \
-    -target arm64-apple-macos13.0 \
-    -target x86_64-apple-macos13.0 \
+    -target $(uname -m)-apple-macos13.0 \
     Sources/TidyMount/*.swift
 
 if [ $? -eq 0 ]; then
@@ -33,6 +32,10 @@ fi
 # Copy Info.plist
 echo "Applying Info.plist..."
 cp Resources/Info.plist "${CONTENTS_DIR}/"
+
+# Code Sign the app (ad-hoc signing for now)
+echo "Code signing the app..."
+codesign --force --deep --sign - "${BUNDLE_DIR}"
 
 # Clean up attributes
 echo "Cleaning up extended attributes..."
