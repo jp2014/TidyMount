@@ -10,7 +10,7 @@ struct TidyMountApp: App {
         } label: {
             Image(systemName: "externaldrive.badge.plus")
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
         
         Settings {
             SettingsView(manager: mountManager)

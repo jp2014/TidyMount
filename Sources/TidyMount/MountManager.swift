@@ -7,6 +7,7 @@ import Combine
 import Network
 import os
 
+@MainActor
 class MountManager: ObservableObject {
     @Published var shares: [NetworkShare] = []
     @Published var statuses: [UUID: Bool] = [:]
@@ -15,65 +16,182 @@ class MountManager: ObservableObject {
     @Published var isCheckingAll: Bool = false
     @Published var isLaunchingAtLogin: Bool = false
     
+    private let logger = Logger(subsystem: "com.tidymount", category: "MountManager")
     private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
     private var cancellableTimer: AnyCancellable?
     private let pathMonitor = NWPathMonitor()
-    private let logger = Logger(subsystem: "com.tidymount", category: "MountManager")
+    
+    private var lastCheckTime: Date = .distantPast
+    private var checkTask: Task<Void, Never>?
+    private let worker = MountWorker()
     
     init() {
         logger.info("MountManager initializing...")
         loadShares()
-        checkAll()
         setupListeners()
         updateLaunchAtLoginStatus()
         
         cancellableTimer = timer.sink { [weak self] _ in
-            self?.checkAll()
+            self?.debouncedCheckAll()
         }
         
         pathMonitor.pathUpdateHandler = { [weak self] path in
             if path.status == .satisfied {
-                self?.logger.info("Network connection change detected, checking mounts...")
                 DispatchQueue.main.async {
-                    self?.checkAll()
+                    self?.debouncedCheckAll()
                 }
             }
         }
         pathMonitor.start(queue: DispatchQueue.global(qos: .background))
+        
+        // Initial check
+        Task {
+            await checkAll(force: true)
+        }
         logger.info("MountManager initialized!")
     }
     
     func setupListeners() {
-        let notificationCenter = NSWorkspace.shared.notificationCenter
+        let nc = NSWorkspace.shared.notificationCenter
         
-        notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.logger.info("Mac woke from sleep, checking mounts...")
-            self?.checkAll()
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.debouncedCheckAll()
+            }
         }
         
-        notificationCenter.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.updateStatuses()
+        nc.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateStatuses()
+            }
         }
         
-        notificationCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.logger.info("A volume was unmounted, checking if we need to reconnect...")
-            self?.checkAll()
-        }
-    }
-    
-    func updateStatuses() {
-        for share in shares {
-            let mounted = isMounted(share: share)
-            DispatchQueue.main.async {
-                self.statuses[share.id] = mounted
+        nc.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleUnmountNotification()
             }
         }
     }
     
-    func updateLaunchAtLoginStatus() {
-        if #available(macOS 13.0, *) {
-            isLaunchingAtLogin = SMAppService.mainApp.status == .enabled
+    private func handleUnmountNotification() {
+        // Ignore if any mount is in progress to prevent feedback loops
+        guard mountingIds.isEmpty else {
+            logger.info("Ignoring unmount notification: mount in progress.")
+            return
         }
+        debouncedCheckAll()
+    }
+    
+    func debouncedCheckAll() {
+        checkTask?.cancel()
+        checkTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second debounce
+            if !Task.isCancelled {
+                await checkAll()
+            }
+        }
+    }
+    
+    func updateStatuses() {
+        Task {
+            for share in shares {
+                let mounted = await worker.isMounted(shareURL: share.url, shareName: share.shareName)
+                statuses[share.id] = mounted
+            }
+        }
+    }
+    
+    func checkAll(force: Bool = false) async {
+        if isCheckingAll && !force { return }
+        
+        isCheckingAll = true
+        logger.info("Starting checkAll(force: \(force))...")
+        if force { unreachableIds.removeAll() }
+        
+        for share in shares {
+            logger.info("Checking share \(share.displayName, privacy: .public)...")
+            await check(share: share)
+        }
+        
+        logger.info("Finished checkAll.")
+        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        isCheckingAll = false
+    }
+    
+    func check(share: NetworkShare) async {
+        let mounted = await worker.isMounted(shareURL: share.url, shareName: share.shareName)
+        statuses[share.id] = mounted
+        
+        logger.info("Share \(share.displayName, privacy: .public): mounted=\(mounted), autoMount=\(share.autoMount), alreadyMounting=\(self.mountingIds.contains(share.id))")
+        
+        if !mounted && share.autoMount && !mountingIds.contains(share.id) {
+            await mount(share: share)
+        }
+    }
+    
+    func mount(share: NetworkShare) async {
+        guard !mountingIds.contains(share.id) else { 
+            logger.info("Mount for \(share.displayName, privacy: .public) already in progress.")
+            return 
+        }
+        
+        mountingIds.insert(share.id)
+        defer { mountingIds.remove(share.id) }
+        
+        logger.info("Starting mount for \(share.displayName, privacy: .public)")
+        
+        let result = await worker.mount(shareURL: share.url, shareName: share.shareName)
+        
+        statuses[share.id] = (result == 0)
+        if result == 0 {
+            unreachableIds.remove(share.id)
+            logger.info("Successfully mounted \(share.displayName, privacy: .public)")
+        } else {
+            logger.error("Mount for \(share.displayName, privacy: .public) failed with status: \(result)")
+            
+            // Exclude errors that mean the server IS reachable but something else is wrong
+            let excludedErrors: Set<Int32> = [17, 2, 13, 1, -1073741275, -36, 60, -1]
+            if !excludedErrors.contains(result) {
+                unreachableIds.insert(share.id)
+            }
+        }
+    }
+    
+    func unmount(share: NetworkShare) {
+        Task {
+            await worker.unmount(shareName: share.shareName)
+            statuses[share.id] = false
+        }
+    }
+    
+    // MARK: - Settings & Persistence
+    
+    func loadShares() {
+        if let data = UserDefaults.standard.data(forKey: "networkShares"),
+           let decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
+            self.shares = decoded
+            logger.info("Loaded \(self.shares.count) shares from UserDefaults.")
+        } else {
+            logger.warning("Failed to load shares from UserDefaults.")
+        }
+    }
+    
+    func saveShares() {
+        if let encoded = try? JSONEncoder().encode(shares) {
+            UserDefaults.standard.set(encoded, forKey: "networkShares")
+        }
+    }
+    
+    func addShare(url: String, name: String) {
+        let newShare = NetworkShare(url: url, displayName: name)
+        shares.append(newShare)
+        saveShares()
+        Task { await check(share: newShare) }
+    }
+    
+    func removeShare(at offsets: IndexSet) {
+        shares.remove(atOffsets: offsets)
+        saveShares()
     }
     
     func toggleLaunchAtLogin() {
@@ -91,245 +209,259 @@ class MountManager: ObservableObject {
         }
     }
     
-    func loadShares() {
-        if let data = UserDefaults.standard.data(forKey: "networkShares"),
-           let decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
-            self.shares = decoded
+    func updateLaunchAtLoginStatus() {
+        if #available(macOS 13.0, *) {
+            isLaunchingAtLogin = SMAppService.mainApp.status == .enabled
         }
     }
+}
+
+// MARK: - Worker Actor
+
+actor MountWorker {
+    private let logger = Logger(subsystem: "com.tidymount", category: "MountWorker")
     
-    func saveShares() {
-        if let encoded = try? JSONEncoder().encode(shares) {
-            UserDefaults.standard.set(encoded, forKey: "networkShares")
+    private func matchesShareName(volumeName: String, shareName: String) -> Bool {
+        let isExactMatch = volumeName.caseInsensitiveCompare(shareName) == .orderedSame
+        let hasSuffixMatch = volumeName.lowercased().hasPrefix("\(shareName.lowercased())-") && Int(volumeName.replacingOccurrences(of: "\(shareName)-", with: "", options: .caseInsensitive)) != nil
+        return isExactMatch || hasSuffixMatch
+    }
+    func isMounted(shareURL: String, shareName: String) async -> Bool {
+        guard let target = normalizeURL(shareURL) else { return false }
+
+        let volumeTask = Task {
+            FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeURLForRemountingKey, .volumeIsLocalKey], options: []) ?? []
         }
-    }
-    
-    func addShare(url: String, name: String) {
-        let newShare = NetworkShare(url: url, displayName: name)
-        shares.append(newShare)
-        saveShares()
-        check(share: newShare)
-    }
-    
-    func removeShare(at offsets: IndexSet) {
-        shares.remove(atOffsets: offsets)
-        saveShares()
-    }
-    
-    func checkAll(forceMount: Bool = false) {
-        logger.info("Check all shares triggered (forceMount: \(forceMount))...")
-        DispatchQueue.main.async {
-            self.isCheckingAll = true
-            if forceMount {
-                self.unreachableIds.removeAll()
+
+        // Timeout after 10 seconds for the volume list itself
+        let mountedVolumes = await withTaskGroup(of: [URL].self) { group -> [URL] in
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                return []
+            }
+            group.addTask {
+                return await volumeTask.value
+            }
+            if let first = await group.next() {
+                group.cancelAll()
+                return first
+            }
+            return []
+        }
+
+        if mountedVolumes.isEmpty {
+            // Check if it was a timeout or just empty
+            // If it was a timeout, volumeTask is still running.
+        }
+
+        for url in mountedVolumes {
+            if matchesShareName(volumeName: url.lastPathComponent, shareName: shareName) {
+                let values = try? url.resourceValues(forKeys: [.volumeURLForRemountingKey])
+                if let remountURL = values?.volumeURLForRemounting?.absoluteString,
+                   let normalizedRemount = normalizeURL(remountURL) {
+                    if normalizedRemount == target {
+                        // Volume found, now check if it is responsive
+                        let responsive = await isResponsive(url: url)
+                        if !responsive {
+                            logger.warning("Volume \(shareName, privacy: .public) found in list but is UNRESPONSIVE.")
+                        }
+                        return responsive
+                    }
+                }
             }
         }
-        
-        for share in shares {
-            check(share: share)
-        }
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            self.isCheckingAll = false
-        }
+        return false
     }
     
-    func check(share: NetworkShare) {
-        // Silently scrub any empty stale directories for this share in the background
-        DispatchQueue.global(qos: .background).async {
-            self.cleanupStaleMount(for: share, forceUnmountActive: false)
-        }
-        
-        let mounted = isMounted(share: share)
-        logger.info("Share '\(share.displayName)' isMounted: \(mounted)")
-        DispatchQueue.main.async {
-            self.statuses[share.id] = mounted
-        }
-        
-        if !mounted && share.autoMount && !mountingIds.contains(share.id) {
-            // If not mounted and auto-mount is on, try to mount
-            mount(share: share)
-        }
-    }
-    
-    func isMounted(share: NetworkShare) -> Bool {
-        let mountedVolumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.isVolumeKey], options: []) ?? []
-        let sharePath = "/Volumes/\(share.shareName)"
-        
-        return mountedVolumes.contains(where: { $0.path == sharePath })
-    }
-    
-    func cleanupStaleMount(for share: NetworkShare, forceUnmountActive: Bool) {
-        let volumeName = share.shareName
-        let volumesDir = "/Volumes"
-        
-        let mountedVolumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.isVolumeKey], options: []) ?? []
-        
-        do {
-            let contents = try FileManager.default.contentsOfDirectory(atPath: volumesDir)
+    private func isResponsive(url: URL) async -> Bool {
+        let path = url.path
+        let task = Task.detached { [self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/df")
+            process.arguments = ["-h", path]
             
-            // Find anything that looks like "ShareName" or "ShareName-1", "ShareName-2", etc.
-            let matches = contents.filter { name in
-                if name == volumeName { return true }
-                if name.hasPrefix("\(volumeName)-") {
-                    let suffix = name.replacingOccurrences(of: "\(volumeName)-", with: "")
-                    return Int(suffix) != nil
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
+            do {
+                try process.run()
+                
+                // Wait for up to 30 seconds
+                let timeout = Date().addingTimeInterval(30.0)
+                while process.isRunning && Date() < timeout {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                 }
+                
+                if process.isRunning {
+                    process.terminate()
+                    self.logger.error("Liveness check for \(path, privacy: .public) TIMED OUT.")
+                    return false
+                }
+                
+                let status = process.terminationStatus
+                if status != 0 {
+                    self.logger.error("Liveness check for \(path, privacy: .public) FAILED with status \(status).")
+                }
+                return status == 0
+            } catch {
                 return false
             }
+        }
+        
+        return await task.value
+    }
+    
+    func mount(shareURL: String, shareName: String) async -> Int32 {
+        var urlString = shareURL
+        if URL(string: urlString) == nil {
+            urlString = urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString
+        }
+        
+        guard let url = URL(string: urlString) else {
+            logger.error("Failed to parse URL: \(shareURL, privacy: .public)")
+            return 22 // EINVAL
+        }
+        
+        let components = URLComponents(string: urlString)
+        let user = components?.user
+        let password = components?.password
+        
+        var cleanURL = url
+        if user != nil || password != nil {
+            var cleanComponents = components
+            cleanComponents?.user = nil
+            cleanComponents?.password = nil
+            if let u = cleanComponents?.url {
+                cleanURL = u
+            }
+        }
+        
+        // 1. Safe pre-check cleanup
+        await cleanupStaleMount(shareName: shareName, forceUnmount: false)
+        
+        // 2. Attempt mount
+        var (status, _) = await mountSync(url: cleanURL, user: user, password: password)
+        
+        // 3. Handle EEXIST (status 17) or Generic Error (status -1)
+        if status == 17 || status == -1 {
+            logger.warning("Mount blocked by status \(status) for \(shareName, privacy: .public). Attempting surgical cleanup...")
+            await cleanupStaleMount(shareName: shareName, forceUnmount: true)
+            (status, _) = await mountSync(url: cleanURL, user: user, password: password)
+        }
+        
+        return status
+    }
+    
+    func unmount(shareName: String) async {
+        let volumesDir = "/Volumes"
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: volumesDir)) ?? []
+        let matches = contents.filter { matchesShareName(volumeName: $0, shareName: shareName) }
+        
+        for match in matches {
+            let path = "\(volumesDir)/\(match)"
+            if let dev = getDeviceID(path: path), let volDev = getDeviceID(path: volumesDir), dev != volDev {
+                try? NSWorkspace.shared.unmountAndEjectDevice(at: URL(fileURLWithPath: path))
+            }
+        }
+    }
+    
+    // MARK: - Internal Helpers
+    
+    private func mountSync(url: URL, user: String?, password: String?) async -> (Int32, [URL]?) {
+        var mountpoints: Unmanaged<CFArray>?
+        
+        let openOptions = ["UIOption": "NoUI"] as NSMutableDictionary
+        let mountOptions = ["MountFlags": 0] as NSMutableDictionary
+        
+        let status = NetFSMountURLSync(
+            url as CFURL,
+            nil,
+            user as CFString?,
+            password as CFString?,
+            openOptions as CFMutableDictionary,
+            mountOptions as CFMutableDictionary,
+            &mountpoints
+        )
+        
+        let urls = (mountpoints?.takeRetainedValue() as? [String])?.map { URL(fileURLWithPath: $0) }
+        return (status, urls)
+    }
+    
+    private func cleanupStaleMount(shareName: String, forceUnmount: Bool) async {
+        let volumesDir = "/Volumes"
+        guard let volumesDev = getDeviceID(path: volumesDir) else { return }
+        
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: volumesDir)) ?? []
+        let matches = contents.filter { matchesShareName(volumeName: $0, shareName: shareName) }
+        
+        for match in matches {
+            let path = "\(volumesDir)/\(match)"
+            guard let dev = getDeviceID(path: path) else { continue }
             
-            for match in matches {
-                let fullPath = "\(volumesDir)/\(match)"
-                let isActuallyMounted = mountedVolumes.contains(where: { $0.path == fullPath })
-                
-                if isActuallyMounted && !forceUnmountActive {
-                    logger.info("Cleanup: Skipping active mount at \(fullPath)")
+            let isActuallyMounted = (dev != volumesDev)
+            
+            if isActuallyMounted {
+                if forceUnmount {
+                    logger.info("Surgical Cleanup: Unmounting active drive at \(path)")
+                    try? NSWorkspace.shared.unmountAndEjectDevice(at: URL(fileURLWithPath: path))
+                } else {
                     continue
                 }
-                
-                logger.info("Aggressive Cleanup: Targeting \(fullPath)")
-                
-                // 1. Forcefully unmount just in case
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-                process.arguments = ["unmount", "force", fullPath]
-                try? process.run()
-                process.waitUntilExit()
-                
-                // 2. Safe deletion (only if empty to prevent data loss)
-                if FileManager.default.fileExists(atPath: fullPath) {
-                    do {
-                        let innerContents = try FileManager.default.contentsOfDirectory(atPath: fullPath)
-                        if innerContents.isEmpty {
-                            try FileManager.default.removeItem(atPath: fullPath)
-                            logger.info("Successfully removed empty directory: \(fullPath)")
-                        } else {
-                            logger.warning("WARNING: Directory \(fullPath) is NOT empty! Skipping deletion to prevent data loss.")
-                        }
-                    } catch {
-                        logger.error("FileManager failed to check/remove \(fullPath): \(error.localizedDescription)")
-                        // Safe fallback: rmdir only deletes if empty
-                        let rmProcess = Process()
-                        rmProcess.executableURL = URL(fileURLWithPath: "/bin/rmdir")
-                        rmProcess.arguments = [fullPath]
-                        try? rmProcess.run()
-                        rmProcess.waitUntilExit()
-                    }
-                }
-            }
-        } catch {
-            logger.error("Failed to read /Volumes for cleanup: \(error.localizedDescription)")
-        }
-    }
-    
-    func mount(share: NetworkShare) {
-        guard let url = URL(string: share.url) else { return }
-        
-        DispatchQueue.main.async {
-            self.mountingIds.insert(share.id)
-        }
-        
-        // Safety timeout for the mounting process (30 seconds)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
-            if self.mountingIds.contains(share.id) {
-                self.logger.warning("Mount process for \(share.displayName) timed out.")
-                self.mountingIds.remove(share.id)
-            }
-        }
-        
-        DispatchQueue.global(qos: .userInitiated).async {
-            // AGGRESSIVE CLEANUP: Force unmount and clear EVERYTHING matching the name before mounting
-            self.cleanupStaleMount(for: share, forceUnmountActive: true)
-            
-            let mountPathString = "/Volumes/\(share.shareName)"
-            
-            // Final check: if a directory still exists with the EXACT name, do not mount.
-            // This prevents the -1 duplication.
-            if FileManager.default.fileExists(atPath: mountPathString) {
-                self.logger.error("Cleanup failed to clear \(mountPathString). Aborting mount to prevent duplication.")
-                DispatchQueue.main.async {
-                    self.mountingIds.remove(share.id)
-                }
-                return
             }
             
-            let openOptions = NSMutableDictionary()
-            openOptions["UIOption"] = "NoUI"
-            let mountOptions = NSMutableDictionary()
-            mountOptions["MountFlags"] = 0
-            
-            var requestID: AsyncRequestID?
-            
-            self.logger.info("Attempting to mount \(share.url) directly to \(mountPathString)...")
-            
-            DispatchQueue.main.async {
-                let status = NetFSMountURLAsync(
-                    url as CFURL,
-                    nil,
-                    nil,
-                    nil,
-                    openOptions as CFMutableDictionary,
-                    mountOptions as CFMutableDictionary,
-                    &requestID,
-                    DispatchQueue.main
-                ) { status, requestID, mountpoints in
-                    DispatchQueue.main.async {
-                        self.mountingIds.remove(share.id)
-                        if status == 0 {
-                            self.logger.info("Successfully mounted: \(share.displayName)")
-                            self.statuses[share.id] = true
-                            self.unreachableIds.remove(share.id)
-                        } else {
-                            self.logger.error("Failed to mount \(share.displayName) with status: \(status)")
-                            self.statuses[share.id] = false
-                            if status != -1073741275 && status != 60 && status != -36 {
-                                self.unreachableIds.insert(share.id)
-                            }
-                        }
-                    }
-                }
-                
-                if status != 0 {
-                    self.logger.error("Failed to initiate mount for \(share.displayName): \(status)")
-                    DispatchQueue.main.async {
-                        self.mountingIds.remove(share.id)
-                        self.unreachableIds.insert(share.id)
-                    }
+            // Ghost Check: Device ID must match /Volumes and directory must be empty
+            if let postDev = getDeviceID(path: path), postDev == volumesDev {
+                if isDirectoryEmpty(path: path) {
+                    logger.info("Surgical Cleanup: Removing ghost folder \(path)")
+                    try? FileManager.default.removeItem(atPath: path)
+                } else {
+                    logger.warning("Surgical Cleanup: \(path) matches Volumes device but is NOT empty. Skipping.")
                 }
             }
         }
     }
     
-    func unmount(share: NetworkShare) {
-        let volumeName = share.shareName
-        let mountedVolumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.isVolumeKey], options: []) ?? []
+    private func normalizeURL(_ urlString: String) -> String? {
+        guard var components = URLComponents(string: urlString) else { return nil }
         
-        let matches = mountedVolumes.filter { url in
-            let name = url.lastPathComponent
-            if name == volumeName { return true }
-            if name.hasPrefix("\(volumeName)-") {
-                let suffix = name.replacingOccurrences(of: "\(volumeName)-", with: "")
-                return Int(suffix) != nil
-            }
-            return false
+        // Normalize credentials: remove them
+        components.user = nil
+        components.password = nil
+        
+        // Normalize query and fragment: remove them
+        components.queryItems = nil
+        components.fragment = nil
+        
+        // Normalize hostname: remove .local suffix if present
+        if let host = components.host, host.lowercased().hasSuffix(".local") {
+            components.host = String(host.dropLast(6))
         }
         
-        logger.info("Unmounting \(share.displayName)...")
-        for url in matches {
-            do {
-                try NSWorkspace.shared.unmountAndEjectDevice(at: url)
-            } catch {
-                logger.error("Failed to unmount \(url.path): \(error.localizedDescription)")
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
-                process.arguments = ["unmount", "force", url.path]
-                try? process.run()
-            }
+        // Normalize path: strip SMB parameters (everything after ;)
+        if let semicolonIndex = components.path.firstIndex(of: ";") {
+            components.path = String(components.path[..<semicolonIndex])
         }
         
-        DispatchQueue.main.async {
-            self.statuses[share.id] = false
+        var normalized = components.url?.absoluteString ?? urlString
+        // Remove trailing slashes
+        while normalized.hasSuffix("/") {
+            normalized.removeLast()
         }
+        
+        return normalized.lowercased()
     }
-
+    
+    private func getDeviceID(path: String) -> dev_t? {
+        var statbuf = stat()
+        if stat(path, &statbuf) == 0 {
+            return statbuf.st_dev
+        }
+        return nil
+    }
+    
+    private func isDirectoryEmpty(path: String) -> Bool {
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+        return contents.isEmpty
+    }
 }

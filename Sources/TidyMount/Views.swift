@@ -48,7 +48,9 @@ struct MainMenuView: View {
                             .controlSize(.small)
                         } else {
                             Button("Mount") {
-                                manager.mount(share: share)
+                                Task {
+                                    await manager.mount(share: share)
+                                }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -63,7 +65,9 @@ struct MainMenuView: View {
             Divider().padding(.vertical, 8)
             
             Button(action: {
-                manager.checkAll(forceMount: true)
+                Task {
+                    await manager.checkAll(force: true)
+                }
             }) {
                 HStack {
                     if manager.isCheckingAll {
@@ -90,7 +94,7 @@ struct MainMenuView: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
         }
-        .frame(width: 250)
+        .frame(width: 320)
     }
 }
 
@@ -142,7 +146,7 @@ struct SettingsView: View {
             }
             .padding()
         }
-        .frame(minWidth: 500, minHeight: 400)
+        .frame(minWidth: 450, minHeight: 400)
         .sheet(isPresented: $showingAddSheet) {
             VStack(spacing: 20) {
                 Text("Add New Share").font(.headline)
