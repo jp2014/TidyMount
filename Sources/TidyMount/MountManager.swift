@@ -105,12 +105,15 @@ class MountManager: ObservableObject {
         if isCheckingAll && !force { return }
         
         isCheckingAll = true
+        logger.info("Starting checkAll(force: \(force))...")
         if force { unreachableIds.removeAll() }
         
         for share in shares {
+            logger.info("Checking share \(share.displayName, privacy: .public)...")
             await check(share: share)
         }
         
+        logger.info("Finished checkAll.")
         try? await Task.sleep(nanoseconds: 1_000_000_000)
         isCheckingAll = false
     }
@@ -119,28 +122,36 @@ class MountManager: ObservableObject {
         let mounted = await worker.isMounted(shareURL: share.url, shareName: share.shareName)
         statuses[share.id] = mounted
         
+        logger.info("Share \(share.displayName, privacy: .public): mounted=\(mounted), autoMount=\(share.autoMount), alreadyMounting=\(self.mountingIds.contains(share.id))")
+        
         if !mounted && share.autoMount && !mountingIds.contains(share.id) {
             await mount(share: share)
         }
     }
     
     func mount(share: NetworkShare) async {
-        guard !mountingIds.contains(share.id) else { return }
+        guard !mountingIds.contains(share.id) else { 
+            logger.info("Mount for \(share.displayName, privacy: .public) already in progress.")
+            return 
+        }
         
         mountingIds.insert(share.id)
         defer { mountingIds.remove(share.id) }
         
-        logger.info("Starting mount for \(share.displayName)")
+        logger.info("Starting mount for \(share.displayName, privacy: .public)")
         
         let result = await worker.mount(shareURL: share.url, shareName: share.shareName)
         
         statuses[share.id] = (result == 0)
         if result == 0 {
             unreachableIds.remove(share.id)
+            logger.info("Successfully mounted \(share.displayName, privacy: .public)")
         } else {
-            // Check if it's a "silent" error or real unreachability
-            // E.g. -1073741275 is user cancelled/timeout
-            if result != -1073741275 && result != 60 && result != -36 {
+            logger.error("Mount for \(share.displayName, privacy: .public) failed with status: \(result)")
+            
+            // Exclude errors that mean the server IS reachable but something else is wrong
+            let excludedErrors: Set<Int32> = [17, 2, 13, 1, -1073741275, -36, 60, -1]
+            if !excludedErrors.contains(result) {
                 unreachableIds.insert(share.id)
             }
         }
@@ -159,6 +170,9 @@ class MountManager: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "networkShares"),
            let decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
             self.shares = decoded
+            logger.info("Loaded \(self.shares.count) shares from UserDefaults.")
+        } else {
+            logger.warning("Failed to load shares from UserDefaults.")
         }
     }
     
@@ -212,19 +226,46 @@ actor MountWorker {
         let hasSuffixMatch = volumeName.lowercased().hasPrefix("\(shareName.lowercased())-") && Int(volumeName.replacingOccurrences(of: "\(shareName)-", with: "", options: .caseInsensitive)) != nil
         return isExactMatch || hasSuffixMatch
     }
-    
     func isMounted(shareURL: String, shareName: String) async -> Bool {
         guard let target = normalizeURL(shareURL) else { return false }
-        
-        let mountedVolumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeURLForRemountingKey], options: []) ?? []
-        
+
+        let volumeTask = Task {
+            FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeURLForRemountingKey, .volumeIsLocalKey], options: []) ?? []
+        }
+
+        // Timeout after 10 seconds for the volume list itself
+        let mountedVolumes = await withTaskGroup(of: [URL].self) { group -> [URL] in
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                return []
+            }
+            group.addTask {
+                return await volumeTask.value
+            }
+            if let first = await group.next() {
+                group.cancelAll()
+                return first
+            }
+            return []
+        }
+
+        if mountedVolumes.isEmpty {
+            // Check if it was a timeout or just empty
+            // If it was a timeout, volumeTask is still running.
+        }
+
         for url in mountedVolumes {
             if matchesShareName(volumeName: url.lastPathComponent, shareName: shareName) {
                 let values = try? url.resourceValues(forKeys: [.volumeURLForRemountingKey])
                 if let remountURL = values?.volumeURLForRemounting?.absoluteString,
                    let normalizedRemount = normalizeURL(remountURL) {
                     if normalizedRemount == target {
-                        return true
+                        // Volume found, now check if it is responsive
+                        let responsive = await isResponsive(url: url)
+                        if !responsive {
+                            logger.warning("Volume \(shareName, privacy: .public) found in list but is UNRESPONSIVE.")
+                        }
+                        return responsive
                     }
                 }
             }
@@ -232,20 +273,81 @@ actor MountWorker {
         return false
     }
     
+    private func isResponsive(url: URL) async -> Bool {
+        let path = url.path
+        let task = Task.detached { [self] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/df")
+            process.arguments = ["-h", path]
+            
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            
+            do {
+                try process.run()
+                
+                // Wait for up to 30 seconds
+                let timeout = Date().addingTimeInterval(30.0)
+                while process.isRunning && Date() < timeout {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                
+                if process.isRunning {
+                    process.terminate()
+                    self.logger.error("Liveness check for \(path, privacy: .public) TIMED OUT.")
+                    return false
+                }
+                
+                let status = process.terminationStatus
+                if status != 0 {
+                    self.logger.error("Liveness check for \(path, privacy: .public) FAILED with status \(status).")
+                }
+                return status == 0
+            } catch {
+                return false
+            }
+        }
+        
+        return await task.value
+    }
+    
     func mount(shareURL: String, shareName: String) async -> Int32 {
-        guard let url = URL(string: shareURL) else { return -1 }
+        var urlString = shareURL
+        if URL(string: urlString) == nil {
+            urlString = urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString
+        }
+        
+        guard let url = URL(string: urlString) else {
+            logger.error("Failed to parse URL: \(shareURL, privacy: .public)")
+            return 22 // EINVAL
+        }
+        
+        let components = URLComponents(string: urlString)
+        let user = components?.user
+        let password = components?.password
+        
+        var cleanURL = url
+        if user != nil || password != nil {
+            var cleanComponents = components
+            cleanComponents?.user = nil
+            cleanComponents?.password = nil
+            if let u = cleanComponents?.url {
+                cleanURL = u
+            }
+        }
         
         // 1. Safe pre-check cleanup
         await cleanupStaleMount(shareName: shareName, forceUnmount: false)
         
         // 2. Attempt mount
-        var (status, _) = await mountAsync(url: url)
+        var (status, _) = await mountSync(url: cleanURL, user: user, password: password)
         
-        // 3. Handle EEXIST (status 17)
-        if status == 17 {
-            logger.warning("Mount blocked by EEXIST for \(shareName). Attempting surgical cleanup...")
+        // 3. Handle EEXIST (status 17) or Generic Error (status -1)
+        if status == 17 || status == -1 {
+            logger.warning("Mount blocked by status \(status) for \(shareName, privacy: .public). Attempting surgical cleanup...")
             await cleanupStaleMount(shareName: shareName, forceUnmount: true)
-            (status, _) = await mountAsync(url: url)
+            (status, _) = await mountSync(url: cleanURL, user: user, password: password)
         }
         
         return status
@@ -266,28 +368,24 @@ actor MountWorker {
     
     // MARK: - Internal Helpers
     
-    private func mountAsync(url: URL) async -> (Int32, [URL]?) {
-        await withCheckedContinuation { continuation in
-            var requestID: AsyncRequestID?
-            let openOptions = ["UIOption": "NoUI"] as NSMutableDictionary
-            let mountOptions = ["MountFlags": 0] as NSMutableDictionary
-            
-            let status = NetFSMountURLAsync(
-                url as CFURL,
-                nil, nil, nil,
-                openOptions as CFMutableDictionary,
-                mountOptions as CFMutableDictionary,
-                &requestID,
-                nil // Uses a default concurrent queue
-            ) { status, requestID, mountpoints in
-                let urls = (mountpoints as? [String])?.map { URL(fileURLWithPath: $0) }
-                continuation.resume(returning: (status, urls))
-            }
-            
-            if status != 0 {
-                continuation.resume(returning: (status, nil))
-            }
-        }
+    private func mountSync(url: URL, user: String?, password: String?) async -> (Int32, [URL]?) {
+        var mountpoints: Unmanaged<CFArray>?
+        
+        let openOptions = ["UIOption": "NoUI"] as NSMutableDictionary
+        let mountOptions = ["MountFlags": 0] as NSMutableDictionary
+        
+        let status = NetFSMountURLSync(
+            url as CFURL,
+            nil,
+            user as CFString?,
+            password as CFString?,
+            openOptions as CFMutableDictionary,
+            mountOptions as CFMutableDictionary,
+            &mountpoints
+        )
+        
+        let urls = (mountpoints?.takeRetainedValue() as? [String])?.map { URL(fileURLWithPath: $0) }
+        return (status, urls)
     }
     
     private func cleanupStaleMount(shareName: String, forceUnmount: Bool) async {
@@ -326,12 +424,31 @@ actor MountWorker {
     
     private func normalizeURL(_ urlString: String) -> String? {
         guard var components = URLComponents(string: urlString) else { return nil }
+        
+        // Normalize credentials: remove them
         components.user = nil
         components.password = nil
+        
+        // Normalize query and fragment: remove them
+        components.queryItems = nil
+        components.fragment = nil
+        
+        // Normalize hostname: remove .local suffix if present
+        if let host = components.host, host.lowercased().hasSuffix(".local") {
+            components.host = String(host.dropLast(6))
+        }
+        
+        // Normalize path: strip SMB parameters (everything after ;)
+        if let semicolonIndex = components.path.firstIndex(of: ";") {
+            components.path = String(components.path[..<semicolonIndex])
+        }
+        
         var normalized = components.url?.absoluteString ?? urlString
+        // Remove trailing slashes
         while normalized.hasSuffix("/") {
             normalized.removeLast()
         }
+        
         return normalized.lowercased()
     }
     

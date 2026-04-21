@@ -38,3 +38,8 @@ DerivedData/
 
 # Local environment
 .env
+run_check.sh
+autologs/
+.gemini/
+$REPORT_FILE
+health_report_*.md
