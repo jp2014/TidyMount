@@ -1,6 +1,9 @@
-# TidyMount 🍏📦
+<img width="268" height="360" alt="image" src="https://github.com/user-attachments/assets/478844ef-f927-4368-8020-b74156b49c93" /># TidyMount 🍏📦
 
 **TidyMount** is a lightweight macOS menu bar utility that ensures your network shares (SMB/AFP/NFS) are always mounted and responsive. It's designed for users who rely on NAS storage and are tired of "Server connection interrupted" errors or empty mount points.
+
+<img width="268" height="360" alt="image" src="https://github.com/user-attachments/assets/e619486c-5626-4340-9196-e4f097af9944" />
+
 
 ## Features
 - **Auto-Mount:** Automatically mounts your configured shares on startup, wake from sleep, or network change.
