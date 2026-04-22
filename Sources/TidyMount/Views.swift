@@ -107,6 +107,17 @@ struct MainMenuView: View {
                 .buttonStyle(.plain)
                 .padding(.vertical, 6)
                 .padding(.horizontal, 12)
+
+                Button(action: {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openWindow(id: "about")
+                }) {
+                    Label("About TidyMount", systemImage: "info.circle")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 12)
                 
                 Divider().padding(.vertical, 4)
                 
