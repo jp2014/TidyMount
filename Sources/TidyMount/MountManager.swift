@@ -16,6 +16,9 @@ class MountManager: ObservableObject {
     @Published var isCheckingAll: Bool = false
     @Published var isLaunchingAtLogin: Bool = false
     
+    private var passwordCache: [UUID: String] = [:]
+    private var checkCount: Int = 0
+    
     private let logger = Logger(subsystem: "com.tidymount", category: "MountManager")
     private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
     private var cancellableTimer: AnyCancellable?
@@ -32,13 +35,16 @@ class MountManager: ObservableObject {
         updateLaunchAtLoginStatus()
         
         cancellableTimer = timer.sink { [weak self] _ in
-            self?.debouncedCheckAll()
+            guard let self = self else { return }
+            self.checkCount += 1
+            let force = self.checkCount % 10 == 0
+            self.debouncedCheckAll(force: force)
         }
         
         pathMonitor.pathUpdateHandler = { [weak self] path in
             if path.status == .satisfied {
                 DispatchQueue.main.async {
-                    self?.debouncedCheckAll()
+                    self?.debouncedCheckAll(force: true)
                 }
             }
         }
@@ -56,7 +62,7 @@ class MountManager: ObservableObject {
         
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
-                self?.debouncedCheckAll()
+                self?.debouncedCheckAll(force: true)
             }
         }
         
@@ -82,12 +88,12 @@ class MountManager: ObservableObject {
         debouncedCheckAll()
     }
     
-    func debouncedCheckAll() {
+    func debouncedCheckAll(force: Bool = false) {
         checkTask?.cancel()
         checkTask = Task {
             try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 second debounce
             if !Task.isCancelled {
-                await checkAll()
+                await checkAll(force: force)
             }
         }
     }
@@ -105,17 +111,22 @@ class MountManager: ObservableObject {
         if isCheckingAll && !force { return }
         
         isCheckingAll = true
+        defer { isCheckingAll = false }
+        
         logger.info("Starting checkAll(force: \(force))...")
         if force { unreachableIds.removeAll() }
         
-        for share in shares {
-            logger.info("Checking share \(share.displayName, privacy: .public)...")
-            await check(share: share)
+        await withTaskGroup(of: Void.self) { group in
+            for share in shares {
+                group.addTask {
+                    self.logger.info("Checking share \(share.displayName, privacy: .public)...")
+                    await self.check(share: share)
+                }
+            }
         }
         
         logger.info("Finished checkAll.")
         try? await Task.sleep(nanoseconds: 1_000_000_000)
-        isCheckingAll = false
     }
     
     func check(share: NetworkShare) async {
@@ -124,7 +135,7 @@ class MountManager: ObservableObject {
         
         logger.info("Share \(share.displayName, privacy: .public): mounted=\(mounted), autoMount=\(share.autoMount), alreadyMounting=\(self.mountingIds.contains(share.id))")
         
-        if !mounted && share.autoMount && !mountingIds.contains(share.id) {
+        if !mounted && share.autoMount && !mountingIds.contains(share.id) && !unreachableIds.contains(share.id) {
             await mount(share: share)
         }
     }
@@ -134,14 +145,34 @@ class MountManager: ObservableObject {
             logger.info("Mount for \(share.displayName, privacy: .public) already in progress.")
             return 
         }
-        
+
         mountingIds.insert(share.id)
-        defer { mountingIds.remove(share.id) }
-        
+        defer { 
+            mountingIds.remove(share.id) 
+            logger.info("Removed \(share.displayName, privacy: .public) from mountingIds (finished).")
+        }
+
         logger.info("Starting mount for \(share.displayName, privacy: .public)")
+
+        // 0. Pre-check reachability if it's an IP or hostname
+        if let url = URL(string: share.url), let host = url.host {
+            let reachable = await isHostReachable(host)
+            if !reachable {
+                logger.error("Host \(host, privacy: .public) is not reachable via TCP 445. Skipping mount.")
+                unreachableIds.insert(share.id)
+                statuses[share.id] = false
+                return
+            }
+        }
+
+        let password = passwordCache[share.id] ?? KeychainHelper.getPassword(account: share.id.uuidString)
+        if let p = password {
+            passwordCache[share.id] = p
+        }
         
-        let password = KeychainHelper.getPassword(account: share.id.uuidString)
+        logger.info("Calling worker.mount for \(share.displayName, privacy: .public)...")
         let result = await worker.mount(shareURL: share.url, shareName: share.shareName, user: share.username, password: password)
+        logger.info("worker.mount returned \(result) for \(share.displayName, privacy: .public)")
         
         statuses[share.id] = (result == 0)
         if result == 0 {
@@ -151,10 +182,50 @@ class MountManager: ObservableObject {
             logger.error("Mount for \(share.displayName, privacy: .public) failed with status: \(result)")
             
             // Exclude errors that mean the server IS reachable but something else is wrong
-            let excludedErrors: Set<Int32> = [17, 2, 13, 1, -1073741275, -36, 60, -1]
+            let excludedErrors: Set<Int32> = [17, 2, 13, 1, -1073741275, -36, 60, 57, -1]
             if !excludedErrors.contains(result) {
                 unreachableIds.insert(share.id)
             }
+        }
+    }
+    
+    private func isHostReachable(_ host: String) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let connection = NWConnection(host: NWEndpoint.Host(host), port: 445, using: .tcp)
+            var resumed = false
+            
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.schedule(deadline: .now() + 2.0)
+            timer.setEventHandler {
+                if !resumed {
+                    resumed = true
+                    connection.cancel()
+                    continuation.resume(returning: false)
+                }
+                timer.cancel()
+            }
+            timer.resume()
+            
+            connection.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    if !resumed {
+                        resumed = true
+                        timer.cancel()
+                        connection.cancel()
+                        continuation.resume(returning: true)
+                    }
+                case .failed, .cancelled:
+                    if !resumed {
+                        resumed = true
+                        timer.cancel()
+                        continuation.resume(returning: false)
+                    }
+                default:
+                    break
+                }
+            }
+            connection.start(queue: .global())
         }
     }
     
@@ -228,6 +299,7 @@ class MountManager: ObservableObject {
         shares.append(newShare)
         
         if let pass = finalPassword {
+            passwordCache[newShare.id] = pass
             KeychainHelper.save(password: pass, account: newShare.id.uuidString)
         }
         
@@ -238,6 +310,7 @@ class MountManager: ObservableObject {
     func removeShare(at offsets: IndexSet) {
         for index in offsets {
             let share = shares[index]
+            passwordCache.removeValue(forKey: share.id)
             KeychainHelper.delete(account: share.id.uuidString)
         }
         shares.remove(atOffsets: offsets)
@@ -246,6 +319,7 @@ class MountManager: ObservableObject {
     
     func removeShare(share: NetworkShare) {
         if let index = shares.firstIndex(where: { $0.id == share.id }) {
+            passwordCache.removeValue(forKey: share.id)
             KeychainHelper.delete(account: share.id.uuidString)
             shares.remove(at: index)
             saveShares()
@@ -290,15 +364,15 @@ class MountManager: ObservableObject {
     func updateLaunchAtLoginStatus() {
         if #available(macOS 13.0, *) {
             let status = SMAppService.mainApp.status
-            logger.info("Current launch at login status: \(String(describing: status))")
+            logger.info("Current launch at login status: <private>")
             isLaunchingAtLogin = (status == .enabled || status == .requiresApproval)
         }
     }
 }
 
-// MARK: - Worker Actor
+// MARK: - Worker
 
-actor MountWorker {
+class MountWorker {
     private let logger = Logger(subsystem: "com.tidymount", category: "MountWorker")
     
     private func matchesShareName(volumeName: String, shareName: String) -> Bool {
@@ -309,29 +383,23 @@ actor MountWorker {
     func isMounted(shareURL: String, shareName: String) async -> Bool {
         guard let target = normalizeURL(shareURL) else { return false }
 
-        let volumeTask = Task {
+        let task = Task.detached {
             FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeURLForRemountingKey, .volumeIsLocalKey], options: []) ?? []
         }
 
-        // Timeout after 10 seconds for the volume list itself
         let mountedVolumes = await withTaskGroup(of: [URL].self) { group -> [URL] in
+            group.addTask {
+                return await task.value
+            }
             group.addTask {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 return []
-            }
-            group.addTask {
-                return await volumeTask.value
             }
             if let first = await group.next() {
                 group.cancelAll()
                 return first
             }
             return []
-        }
-
-        if mountedVolumes.isEmpty {
-            // Check if it was a timeout or just empty
-            // If it was a timeout, volumeTask is still running.
         }
 
         for url in mountedVolumes {
@@ -355,7 +423,7 @@ actor MountWorker {
     
     private func isResponsive(url: URL) async -> Bool {
         let path = url.path
-        let task = Task.detached { [self] in
+        let task = Task.detached {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/df")
             process.arguments = ["-h", path]
@@ -366,30 +434,27 @@ actor MountWorker {
             
             do {
                 try process.run()
-                
-                // Wait for up to 30 seconds
-                let timeout = Date().addingTimeInterval(30.0)
-                while process.isRunning && Date() < timeout {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                
-                if process.isRunning {
-                    process.terminate()
-                    self.logger.error("Liveness check for \(path, privacy: .public) TIMED OUT.")
-                    return false
-                }
-                
-                let status = process.terminationStatus
-                if status != 0 {
-                    self.logger.error("Liveness check for \(path, privacy: .public) FAILED with status \(status).")
-                }
-                return status == 0
+                process.waitUntilExit()
+                return process.terminationStatus == 0
             } catch {
                 return false
             }
         }
         
-        return await task.value
+        // Timeout after 5 seconds for responsiveness check
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                return await task.value
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                task.cancel()
+                return false
+            }
+            let result = await group.next()
+            group.cancelAll()
+            return result ?? false
+        }
     }
     
     func mount(shareURL: String, shareName: String, user: String?, password: String?) async -> Int32 {
@@ -446,55 +511,112 @@ actor MountWorker {
     // MARK: - Internal Helpers
     
     private func mountSync(url: URL, user: String?, password: String?) async -> (Int32, [URL]?) {
-        var mountpoints: Unmanaged<CFArray>?
+        logger.info("mountSync: Starting NetFSMountURLAsync for \(url.absoluteString, privacy: .public)")
         
-        let openOptions = ["UIOption": "NoUI"] as NSMutableDictionary
-        let mountOptions = ["MountFlags": 0] as NSMutableDictionary
-        
-        let status = NetFSMountURLSync(
-            url as CFURL,
-            nil,
-            user as CFString?,
-            password as CFString?,
-            openOptions as CFMutableDictionary,
-            mountOptions as CFMutableDictionary,
-            &mountpoints
-        )
-        
-        let urls = (mountpoints?.takeRetainedValue() as? [String])?.map { URL(fileURLWithPath: $0) }
-        return (status, urls)
+        return await withTaskGroup(of: (Int32, [URL]?).self) { group in
+            group.addTask {
+                await withCheckedContinuation { continuation in
+                    let openOptions = ["UIOption": "NoUI"] as NSMutableDictionary
+                    let mountOptions = ["MountFlags": 0] as NSMutableDictionary
+                    var requestID: AsyncRequestID?
+                    
+                    var resumed = false
+                    let status = NetFSMountURLAsync(
+                        url as CFURL,
+                        nil,
+                        user as CFString?,
+                        password as CFString?,
+                        openOptions as CFMutableDictionary,
+                        mountOptions as CFMutableDictionary,
+                        &requestID,
+                        DispatchQueue.global(qos: .background)
+                    ) { status, _, mountpoints in
+                        if !resumed {
+                            resumed = true
+                            let urls = (mountpoints as? [String])?.map { URL(fileURLWithPath: $0) }
+                            continuation.resume(returning: (status, urls))
+                        }
+                    }
+                    
+                    if status != 0 {
+                        if !resumed {
+                            resumed = true
+                            continuation.resume(returning: (status, nil))
+                        }
+                    }
+                    
+                    // Safety timeout for the continuation itself
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 65.0) {
+                        if !resumed {
+                            resumed = true
+                            self.logger.error("mountSync: Continuation safety timeout triggered for \(url.host ?? "unknown")")
+                            continuation.resume(returning: (60, nil))
+                        }
+                    }
+                }
+            }
+            
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                return (60, nil) // ETIMEDOUT
+            }
+            
+            let result = await group.next()
+            group.cancelAll()
+            let finalResult = result ?? (60, nil)
+            logger.info("mountSync finished with status \(finalResult.0)")
+            return finalResult
+        }
     }
     
     private func cleanupStaleMount(shareName: String, forceUnmount: Bool) async {
         let volumesDir = "/Volumes"
-        guard let volumesDev = getDeviceID(path: volumesDir) else { return }
+        guard let volumesDev = getDeviceID(path: volumesDir) else { 
+            logger.error("cleanupStaleMount: Failed to get device ID for /Volumes")
+            return 
+        }
         
         let contents = (try? FileManager.default.contentsOfDirectory(atPath: volumesDir)) ?? []
         let matches = contents.filter { matchesShareName(volumeName: $0, shareName: shareName) }
         
+        logger.info("cleanupStaleMount for \(shareName, privacy: .public): matches=\(matches)")
+        
         for match in matches {
             let path = "\(volumesDir)/\(match)"
-            guard let dev = getDeviceID(path: path) else { continue }
             
-            let isActuallyMounted = (dev != volumesDev)
+            // Run inspection in a detached task to avoid hanging MainActor
+            let (isActuallyMounted, deviceID) = await Task.detached(priority: .background) {
+                guard let dev = self.getDeviceID(path: path) else { return (false, nil as dev_t?) }
+                return (dev != volumesDev, dev)
+            }.value
             
             if isActuallyMounted {
                 if forceUnmount {
                     logger.info("Surgical Cleanup: Unmounting active drive at \(path)")
-                    try? NSWorkspace.shared.unmountAndEjectDevice(at: URL(fileURLWithPath: path))
+                    await Task.detached(priority: .background) {
+                        try? NSWorkspace.shared.unmountAndEjectDevice(at: URL(fileURLWithPath: path))
+                    }.value
                 } else {
+                    logger.info("cleanupStaleMount: \(path) is actually mounted, skipping (forceUnmount=false)")
                     continue
                 }
             }
             
             // Ghost Check: Device ID must match /Volumes and directory must be empty
-            if let postDev = getDeviceID(path: path), postDev == volumesDev {
-                if isDirectoryEmpty(path: path) {
-                    logger.info("Surgical Cleanup: Removing ghost folder \(path)")
-                    try? FileManager.default.removeItem(atPath: path)
-                } else {
-                    logger.warning("Surgical Cleanup: \(path) matches Volumes device but is NOT empty. Skipping.")
+            let isGhost = await Task.detached(priority: .background) {
+                if let postDev = self.getDeviceID(path: path), postDev == volumesDev {
+                    return self.isDirectoryEmpty(path: path)
                 }
+                return false
+            }.value
+
+            if isGhost {
+                logger.info("Surgical Cleanup: Removing ghost folder \(path)")
+                await Task.detached(priority: .background) {
+                    try? FileManager.default.removeItem(atPath: path)
+                }.value
+            } else if deviceID == volumesDev {
+                logger.warning("Surgical Cleanup: \(path) matches Volumes device but is NOT empty. Skipping.")
             }
         }
     }
