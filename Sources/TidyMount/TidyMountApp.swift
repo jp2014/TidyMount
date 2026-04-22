@@ -8,13 +8,6 @@ struct TidyMountApp: App {
     var body: some Scene {
         MenuBarExtra {
             MainMenuView(manager: mountManager)
-            
-            Divider()
-            
-            Button("About TidyMount") {
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "about")
-            }
         } label: {
             if let url = Bundle.main.url(forResource: "MenuBarIconTemplate", withExtension: "png"),
                let image = NSImage(contentsOf: url) {
