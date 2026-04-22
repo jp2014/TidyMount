@@ -206,28 +206,29 @@ class MountManager: ObservableObject {
         }
     }
     
-    func addShare(url: String, name: String) {
-        var cleanURL = url
-        var username: String?
-        var password: String?
+    func addShare(url: String, name: String, username: String? = nil, password: String? = nil) {
+        var finalURL = url
+        var finalUsername = username
+        var finalPassword = password
         
+        // If credentials are also in the URL, they take precedence for extraction
         if let components = URLComponents(string: url) {
-            username = components.user
-            password = components.password
+            if components.user != nil { finalUsername = components.user }
+            if components.password != nil { finalPassword = components.password }
             
             var cleanComponents = components
             cleanComponents.user = nil
             cleanComponents.password = nil
             if let u = cleanComponents.url?.absoluteString {
-                cleanURL = u
+                finalURL = u
             }
         }
         
-        let newShare = NetworkShare(url: cleanURL, displayName: name, username: username)
+        let newShare = NetworkShare(url: finalURL, displayName: name, username: finalUsername)
         shares.append(newShare)
         
-        if let password = password {
-            KeychainHelper.save(password: password, account: newShare.id.uuidString)
+        if let pass = finalPassword {
+            KeychainHelper.save(password: pass, account: newShare.id.uuidString)
         }
         
         saveShares()
@@ -241,6 +242,14 @@ class MountManager: ObservableObject {
         }
         shares.remove(atOffsets: offsets)
         saveShares()
+    }
+    
+    func removeShare(share: NetworkShare) {
+        if let index = shares.firstIndex(where: { $0.id == share.id }) {
+            KeychainHelper.delete(account: share.id.uuidString)
+            shares.remove(at: index)
+            saveShares()
+        }
     }
     
     func setLaunchAtLogin(enabled: Bool) {
