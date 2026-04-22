@@ -12,7 +12,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Import Apple Certificate
         if: env.CERTIFICATE_P12_BASE64 != ''
@@ -55,7 +55,7 @@ jobs:
           zip -r TidyMount.app.zip TidyMount.app
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: TidyMount-Build
           path: TidyMount.app.zip
