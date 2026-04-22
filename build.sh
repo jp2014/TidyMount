@@ -33,9 +33,32 @@ fi
 echo "Applying Info.plist..."
 cp Resources/Info.plist "${CONTENTS_DIR}/"
 
-# Code Sign the app (ad-hoc signing for now)
+# Copy Icon if it exists
+if [ -f "Resources/AppIcon.icns" ]; then
+    echo "Copying AppIcon.icns..."
+    mkdir -p "${CONTENTS_DIR}/Resources"
+    cp Resources/AppIcon.icns "${CONTENTS_DIR}/Resources/"
+fi
+
+# Copy MenuBarIcon if it exists
+if [ -f "Resources/MenuBarIconTemplate.png" ]; then
+    echo "Copying MenuBarIcon..."
+    mkdir -p "${CONTENTS_DIR}/Resources"
+    cp Resources/MenuBarIconTemplate*.png "${CONTENTS_DIR}/Resources/"
+fi
+
+# Code Sign the app
 echo "Code signing the app..."
-codesign --force --deep --sign - "${BUNDLE_DIR}"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
+ENTITLEMENTS="Resources/TidyMount.entitlements"
+
+if [ "$SIGNING_IDENTITY" != "-" ]; then
+    echo "Using Identity: $SIGNING_IDENTITY"
+    codesign --force --deep --options runtime --entitlements "$ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "${BUNDLE_DIR}"
+else
+    echo "Ad-hoc signing..."
+    codesign --force --deep --sign - "${BUNDLE_DIR}"
+fi
 
 # Clean up attributes
 echo "Cleaning up extended attributes..."
