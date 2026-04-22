@@ -19,6 +19,7 @@ swiftc -o "${MACOS_DIR}/${APP_NAME}" \
     -framework ServiceManagement \
     -framework Network \
     -framework Combine \
+    -framework IOKit \
     -target $(uname -m)-apple-macos13.0 \
     Sources/TidyMount/*.swift
 

@@ -278,7 +278,8 @@ struct SettingsView: View {
                     }
                 }
             }
-            .listStyle(.sidebar)
+            .listStyle(.inset)
+            .environment(\.layoutDirection, .leftToRight)
             
             Divider()
             
