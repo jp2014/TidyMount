@@ -140,7 +140,8 @@ class MountManager: ObservableObject {
         
         logger.info("Starting mount for \(share.displayName, privacy: .public)")
         
-        let result = await worker.mount(shareURL: share.url, shareName: share.shareName)
+        let password = KeychainHelper.getPassword(account: share.id.uuidString)
+        let result = await worker.mount(shareURL: share.url, shareName: share.shareName, user: share.username, password: password)
         
         statuses[share.id] = (result == 0)
         if result == 0 {
@@ -168,8 +169,31 @@ class MountManager: ObservableObject {
     
     func loadShares() {
         if let data = UserDefaults.standard.data(forKey: "networkShares"),
-           let decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
+           var decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
+            
+            // Migration: Check for passwords in URLs and move them to Keychain
+            var needsResave = false
+            for i in 0..<decoded.count {
+                if let components = URLComponents(string: decoded[i].url), 
+                   let password = components.password {
+                    
+                    // Move to Keychain
+                    KeychainHelper.save(password: password, account: decoded[i].id.uuidString)
+                    decoded[i].username = components.user
+                    
+                    // Sanitize URL
+                    var cleanComponents = components
+                    cleanComponents.user = nil
+                    cleanComponents.password = nil
+                    if let cleanURL = cleanComponents.url?.absoluteString {
+                        decoded[i].url = cleanURL
+                    }
+                    needsResave = true
+                }
+            }
+            
             self.shares = decoded
+            if needsResave { saveShares() }
             logger.info("Loaded \(self.shares.count) shares from UserDefaults.")
         } else {
             logger.warning("Failed to load shares from UserDefaults.")
@@ -183,13 +207,38 @@ class MountManager: ObservableObject {
     }
     
     func addShare(url: String, name: String) {
-        let newShare = NetworkShare(url: url, displayName: name)
+        var cleanURL = url
+        var username: String?
+        var password: String?
+        
+        if let components = URLComponents(string: url) {
+            username = components.user
+            password = components.password
+            
+            var cleanComponents = components
+            cleanComponents.user = nil
+            cleanComponents.password = nil
+            if let u = cleanComponents.url?.absoluteString {
+                cleanURL = u
+            }
+        }
+        
+        let newShare = NetworkShare(url: cleanURL, displayName: name, username: username)
         shares.append(newShare)
+        
+        if let password = password {
+            KeychainHelper.save(password: password, account: newShare.id.uuidString)
+        }
+        
         saveShares()
         Task { await check(share: newShare) }
     }
     
     func removeShare(at offsets: IndexSet) {
+        for index in offsets {
+            let share = shares[index]
+            KeychainHelper.delete(account: share.id.uuidString)
+        }
         shares.remove(atOffsets: offsets)
         saveShares()
     }
@@ -334,7 +383,7 @@ actor MountWorker {
         return await task.value
     }
     
-    func mount(shareURL: String, shareName: String) async -> Int32 {
+    func mount(shareURL: String, shareName: String, user: String?, password: String?) async -> Int32 {
         var urlString = shareURL
         if URL(string: urlString) == nil {
             urlString = urlString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? urlString
@@ -345,16 +394,13 @@ actor MountWorker {
             return 22 // EINVAL
         }
         
-        let components = URLComponents(string: urlString)
-        let user = components?.user
-        let password = components?.password
-        
         var cleanURL = url
-        if user != nil || password != nil {
+        // Ensure the URL used for mounting is clean of any embedded credentials
+        if let components = URLComponents(string: urlString) {
             var cleanComponents = components
-            cleanComponents?.user = nil
-            cleanComponents?.password = nil
-            if let u = cleanComponents?.url {
+            cleanComponents.user = nil
+            cleanComponents.password = nil
+            if let u = cleanComponents.url {
                 cleanURL = u
             }
         }

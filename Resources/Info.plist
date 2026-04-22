@@ -12,6 +12,8 @@
     <string>1.0</string>
     <key>CFBundleExecutable</key>
     <string>TidyMount</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon.icns</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
