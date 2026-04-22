@@ -73,6 +73,13 @@ struct MainMenuView: View {
                                 .disabled(isMounting)
                             }
                         }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                manager.removeShare(share: share)
+                            } label: {
+                                Label("Delete Share", systemImage: "trash")
+                            }
+                        }
                     }
                 }
             }
@@ -156,7 +163,7 @@ struct AboutView: View {
                 .padding(.horizontal, 30)
                 .foregroundColor(.primary.opacity(0.8))
             
-            Link(destination: URL(string: "https://github.com/jordanpetersen/TidyMount")!) {
+            Link(destination: URL(string: "https://github.com/jp2014/TidyMount")!) {
                 HStack {
                     Image(systemName: "link")
                     Text("Visit GitHub Repository")
@@ -175,6 +182,8 @@ struct SettingsView: View {
     @ObservedObject var manager: MountManager
     @State private var newURL: String = "smb://"
     @State private var newName: String = ""
+    @State private var newUsername: String = ""
+    @State private var newPassword: String = ""
     @State private var showingAddSheet = false
     
     var body: some View {
@@ -205,6 +214,16 @@ struct SettingsView: View {
                                 }
                             }
                             Spacer()
+                            
+                            Button(action: {
+                                manager.removeShare(share: share)
+                            }) {
+                                Image(systemName: "trash")
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Delete this share")
+                            
                             Toggle("Auto", isOn: Binding(
                                 get: { share.autoMount },
                                 set: { newValue in
@@ -219,6 +238,13 @@ struct SettingsView: View {
                             .help("Auto-mount this share")
                         }
                         .padding(.vertical, 4)
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                manager.removeShare(share: share)
+                            } label: {
+                                Label("Delete Share", systemImage: "trash")
+                            }
+                        }
                     }
                     .onDelete(perform: manager.removeShare)
                 }
@@ -284,15 +310,36 @@ struct SettingsView: View {
                     
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Server URL").font(.caption).fontWeight(.semibold).foregroundColor(.secondary)
-                        TextField("smb://user:pass@server/share", text: $newURL)
+                        TextField("smb://server/share", text: $newURL)
                             .textFieldStyle(.roundedBorder)
                             .controlSize(.large)
                         
-                        Text("Passwords will be stored securely in your macOS Keychain.")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .padding(.top, 2)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Examples:").font(.caption2).fontWeight(.bold)
+                            Text("• smb://nas.local/movies").font(.caption2)
+                            Text("• afp://192.168.1.50/backups").font(.caption2)
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
                     }
+                    
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Username (Optional)").font(.caption).fontWeight(.semibold).foregroundColor(.secondary)
+                            TextField("username", text: $newUsername)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Password (Optional)").font(.caption).fontWeight(.semibold).foregroundColor(.secondary)
+                            SecureField("password", text: $newPassword)
+                                .textFieldStyle(.roundedBorder)
+                        }
+                    }
+                    
+                    Text("Credentials will be stored securely in your macOS Keychain.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
                 
                 HStack(spacing: 12) {
@@ -305,11 +352,18 @@ struct SettingsView: View {
                     Spacer()
                     
                     Button("Add Share") {
-                        if !newName.isEmpty && newURL.starts(with: "smb://") {
-                            manager.addShare(url: newURL, name: newName)
+                        if !newName.isEmpty && newURL.contains("://") {
+                            manager.addShare(
+                                url: newURL, 
+                                name: newName, 
+                                username: newUsername.isEmpty ? nil : newUsername, 
+                                password: newPassword.isEmpty ? nil : newPassword
+                            )
                             showingAddSheet = false
                             newName = ""
                             newURL = "smb://"
+                            newUsername = ""
+                            newPassword = ""
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -318,7 +372,7 @@ struct SettingsView: View {
                 }
             }
             .padding(32)
-            .frame(width: 450)
+            .frame(width: 500)
         }
     }
 }
