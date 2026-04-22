@@ -156,7 +156,7 @@ struct AboutView: View {
                 .padding(.horizontal, 30)
                 .foregroundColor(.primary.opacity(0.8))
             
-            Link(destination: URL(string: "https://github.com/jordanpetersen/TidyMount")!) {
+            Link(destination: URL(string: "https://github.com/jp2014/TidyMount")!) {
                 HStack {
                     Image(systemName: "link")
                     Text("Visit GitHub Repository")

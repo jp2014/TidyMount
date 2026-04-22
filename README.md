@@ -16,7 +16,7 @@
 3. Open the app and configure your shares in **Settings...**.
 
 ## Usage
-- Click the drive icon in your menu bar (`externaldrive.badge.plus`).
+- Click the **TidyMount** icon in your menu bar (a stylized drive with a network link).
 - Add a share using the format: `smb://user:password@server/share`.
 - TidyMount will extract the credentials to your Keychain and keep the share mounted.
 
