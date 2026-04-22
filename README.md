@@ -7,7 +7,7 @@
 
 ## Features
 - **Auto-Mount:** Automatically mounts your configured shares on startup, wake from sleep, or network change.
-- **Surgical Cleanup:** Detects and removes "ghost" folders in `/Volumes` that can block new mounts.
+- **Surgical Cleanup:** Detects and removes "ghost" folders in `/Volumes` that can block new mounts or cause duplicate suffixes (e.g., `-1`, `-2`).
 - **Liveness Monitoring:** Periodically checks if shares are responsive and attempts to remount them if they hang.
 - **Secure Storage:** Uses the **macOS Keychain** to store your NAS credentials securely.
 - **Launch at Login:** Option to start TidyMount automatically when you log in.
