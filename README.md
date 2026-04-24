@@ -8,7 +8,7 @@
 - **Auto-Mount:** Automatically mounts your configured shares on startup, wake from sleep, or network change.
 - **Surgical Cleanup:** Detects and removes "ghost" folders in `/Volumes` that can block new mounts or cause duplicate suffixes (e.g., `-1`, `-2`).
 - **Liveness Monitoring:** Periodically checks if shares are responsive and attempts to remount them if they hang.
-- **Secure Storage:** Passwords are stored securely and locally only on your machine.
+- **Secure Storage:** Uses the **macOS Keychain** to store your NAS credentials securely.
 - **Launch at Login:** Option to start TidyMount automatically when you log in.
 - **Menu Bar UI:** Quick status overview and manual mount/unmount controls.
 
@@ -20,7 +20,7 @@
 ## Usage
 - Click the **TidyMount** icon in your menu bar (a stylized drive with a network link).
 - Add a share using its URL (e.g., `smb://server/share`).
-- **Optional Credentials:** You can include credentials in the URL format `smb://user:password@server/share`. TidyMount will automatically extract them and store them securely and locally on your machine.
+- **Optional Credentials:** You can include credentials in the URL format `smb://user:password@server/share`. TidyMount will automatically extract them to your Keychain and store a "clean" URL.
 
 ## Build from Source
 If you have Swift and Xcode installed, you can build the app locally:

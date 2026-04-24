@@ -242,13 +242,13 @@ class MountManager: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "networkShares"),
            var decoded = try? JSONDecoder().decode([NetworkShare].self, from: data) {
             
-            // Migration: Check for passwords in URLs and move them to secure vault
+            // Migration: Check for passwords in URLs and move them to Keychain
             var needsResave = false
             for i in 0..<decoded.count {
                 if let components = URLComponents(string: decoded[i].url), 
                    let password = components.password {
                     
-                    // Move to vault
+                    // Move to Keychain
                     KeychainHelper.save(password: password, account: decoded[i].id.uuidString)
                     decoded[i].username = components.user
                     
