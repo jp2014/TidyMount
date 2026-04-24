@@ -349,7 +349,7 @@ struct SettingsView: View {
                         }
                     }
                     
-                    Text("Credentials will be stored securely in your macOS Keychain.")
+                    Text("Credentials will be stored securely and locally on your machine.")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }

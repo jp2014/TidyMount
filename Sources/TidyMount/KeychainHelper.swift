@@ -53,9 +53,9 @@ struct KeychainHelper {
             return pass
         }
         
-        // MIGRATION DISABLED: To prevent persistent system keychain prompts.
+        // MIGRATION DISABLED: To prevent persistent system prompts.
         // User will need to re-enter passwords once in the app settings to save to the new vault.
-        logger.info("Password not found in vault for: \(account, privacy: .public). Skipping system keychain to avoid prompts.")
+        logger.info("Password not found in vault for: \(account, privacy: .public). Skipping legacy system keychain to avoid prompts.")
         return nil
     }
     
