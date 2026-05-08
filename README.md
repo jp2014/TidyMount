@@ -2,6 +2,8 @@
 
 **TidyMount** is a lightweight macOS menu bar utility that ensures your network shares (SMB/AFP/NFS) are always mounted and responsive. It's designed for users who rely on NAS storage and are tired of "Server connection interrupted" errors or empty mount points.
 
+⚠️ This is experimental. I've had mixed results with it. Drive mounting is still flakey on mac and occasionally just needs a system reboot with my setup.
+
 <img width="248" height="323" alt="image" src="https://github.com/user-attachments/assets/9e6c89ad-3ac5-4f9e-b228-07d623b88b86" />
 
 ## Features
