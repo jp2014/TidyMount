@@ -20,7 +20,7 @@ class MountManager: ObservableObject {
     private var checkCount: Int = 0
     
     private let logger = Logger(subsystem: "com.tidymount", category: "MountManager")
-    private let timer = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 1200, on: .main, in: .common).autoconnect() // 20 minutes
     private var cancellableTimer: AnyCancellable?
     private let pathMonitor = NWPathMonitor()
     
@@ -37,7 +37,7 @@ class MountManager: ObservableObject {
         cancellableTimer = timer.sink { [weak self] _ in
             guard let self = self else { return }
             self.checkCount += 1
-            let force = self.checkCount % 10 == 0
+            let force = self.checkCount % 15 == 0 // Every 15 ticks (5 hours at 20m/tick)
             self.debouncedCheckAll(force: force)
         }
         
@@ -403,12 +403,13 @@ class MountWorker {
         }
 
         for url in mountedVolumes {
-            if matchesShareName(volumeName: url.lastPathComponent, shareName: shareName) {
+            let volumeName = url.lastPathComponent
+            if volumeName.caseInsensitiveCompare(shareName) == .orderedSame {
                 let values = try? url.resourceValues(forKeys: [.volumeURLForRemountingKey])
                 if let remountURL = values?.volumeURLForRemounting?.absoluteString,
                    let normalizedRemount = normalizeURL(remountURL) {
                     if normalizedRemount == target {
-                        // Volume found, now check if it is responsive
+                        // Volume found on primary path, now check if it is responsive
                         let responsive = await isResponsive(url: url)
                         if !responsive {
                             logger.warning("Volume \(shareName, privacy: .public) found in list but is UNRESPONSIVE.")
@@ -613,10 +614,45 @@ class MountWorker {
             if isGhost {
                 logger.info("Surgical Cleanup: Removing ghost folder \(path)")
                 await Task.detached(priority: .background) {
-                    try? FileManager.default.removeItem(atPath: path)
+                    do {
+                        try FileManager.default.removeItem(atPath: path)
+                        self.logger.info("Surgical Cleanup: Successfully removed \(path) via FileManager")
+                    } catch {
+                        self.logger.warning("FileManager failed to remove \(path): \(error.localizedDescription). Attempting daemon removal.")
+                        
+                        let service = SMAppService.daemon(plistName: "com.tidymount.helper.plist")
+                        if service.status != .enabled {
+                            do {
+                                self.logger.info("Registering helper daemon...")
+                                try service.register()
+                            } catch {
+                                self.logger.error("Failed to register helper daemon: \(error.localizedDescription)")
+                            }
+                        }
+                        
+                        let connection = NSXPCConnection(machServiceName: "com.tidymount.helper", options: .privileged)
+                        connection.remoteObjectInterface = NSXPCInterface(with: TidyMountHelperProtocol.self)
+                        connection.resume()
+                        
+                        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+                            self.logger.error("XPC connection failed: \(error.localizedDescription)")
+                        } as? TidyMountHelperProtocol
+                        
+                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            proxy?.removeGhostDirectory(at: path) { success, error in
+                                if success {
+                                    self.logger.info("Surgical Cleanup: Successfully removed \(path) via helper daemon")
+                                } else {
+                                    self.logger.error("Helper daemon removal failed: \(error?.localizedDescription ?? "Unknown error")")
+                                }
+                                continuation.resume()
+                            } ?? continuation.resume()
+                        }
+                        connection.invalidate()
+                    }
                 }.value
             } else if deviceID == volumesDev {
-                logger.warning("Surgical Cleanup: \(path) matches Volumes device but is NOT empty. Skipping.")
+                logger.warning("Surgical Cleanup: \(path) matches Volumes device but is NOT empty or cannot be read. Skipping.")
             }
         }
     }
@@ -660,7 +696,19 @@ class MountWorker {
     }
     
     private func isDirectoryEmpty(path: String) -> Bool {
-        let contents = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
-        return contents.isEmpty
+        do {
+            let contents = try FileManager.default.contentsOfDirectory(atPath: path)
+            return contents.isEmpty
+        } catch {
+            let nsError = error as NSError
+            if nsError.code == NSFileReadNoPermissionError {
+                // If we can't read it due to permissions, return true to allow the 
+                // elevated rmdir to attempt removal. rmdir will safely fail if it's not actually empty.
+                logger.warning("Permission denied reading \(path). Assuming empty to allow safe elevated rmdir attempt.")
+                return true
+            }
+            logger.error("Failed to read directory contents for \(path): \(error.localizedDescription)")
+            return false
+        }
     }
 }

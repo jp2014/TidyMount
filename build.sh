@@ -9,8 +9,8 @@ MACOS_DIR="${CONTENTS_DIR}/MacOS"
 echo "Creating bundle structure..."
 mkdir -p "${MACOS_DIR}"
 
-# Compile Binary
-echo "Compiling Binary for $(uname -m)..."
+# Compile Main App Binary
+echo "Compiling Main App Binary for $(uname -m)..."
 swiftc -o "${MACOS_DIR}/${APP_NAME}" \
     -sdk $(xcrun --show-sdk-path) \
     -framework NetFS \
@@ -21,14 +21,30 @@ swiftc -o "${MACOS_DIR}/${APP_NAME}" \
     -framework Combine \
     -framework IOKit \
     -target $(uname -m)-apple-macos13.0 \
-    Sources/TidyMount/*.swift
+    Sources/TidyMount/*.swift Sources/Helper/TidyMountHelperProtocol.swift
 
-if [ $? -eq 0 ]; then
-    echo "Compilation successful."
-else
-    echo "Compilation failed."
+if [ $? -ne 0 ]; then
+    echo "App Compilation failed."
     exit 1
 fi
+
+# Compile Helper Daemon
+echo "Compiling Helper Daemon..."
+swiftc -o "${MACOS_DIR}/com.tidymount.helper" \
+    -sdk $(xcrun --show-sdk-path) \
+    -framework Foundation \
+    -target $(uname -m)-apple-macos13.0 \
+    Sources/Helper/*.swift
+
+if [ $? -ne 0 ]; then
+    echo "Helper Compilation failed."
+    exit 1
+fi
+
+# Bundle the daemon plist
+echo "Bundling LaunchDaemon plist..."
+mkdir -p "${CONTENTS_DIR}/Library/LaunchDaemons"
+cp Resources/com.tidymount.helper.plist "${CONTENTS_DIR}/Library/LaunchDaemons/"
 
 # Copy Info.plist
 echo "Applying Info.plist..."
